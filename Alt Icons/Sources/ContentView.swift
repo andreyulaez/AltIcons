@@ -346,18 +346,24 @@ final class ViewModel: ObservableObject {
     }
     
     func resizeCGImage(_ image: CGImage, width: Int, height: Int) -> CGImage? {
-        guard let colorSpace = image.colorSpace,
-              let context = CGContext(data: nil,
-                                     width: width,
-                                     height: height,
-                                     bitsPerComponent: image.bitsPerComponent,
-                                     bytesPerRow: 0,
-                                     space: colorSpace,
-                                     bitmapInfo: image.bitmapInfo.rawValue)
-        else { return nil }
-        
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+                     | CGBitmapInfo.byteOrder32Big.rawValue
+
+        guard let context = CGContext(
+                data: nil,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: colorSpace,
+                bitmapInfo: bitmapInfo
+        ) else {
+            return nil
+        }
+
         context.interpolationQuality = .high
-        context.draw(image, in: CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)))
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
         return context.makeImage()
     }
     
