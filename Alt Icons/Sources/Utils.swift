@@ -110,13 +110,22 @@ enum ProjectDiscovery {
     }
 
     static func bestXcassetsIndex(xcassets: [URL], iconNames: [String]) -> Int? {
-        guard !iconNames.isEmpty else { return nil }
-        for (index, url) in xcassets.enumerated() {
-            for name in iconNames {
-                let setURL = url.appendingPathComponent("\(name).appiconset")
-                if fm.fileExists(atPath: setURL.path) {
-                    return index
+        // Try alternate icons first
+        if !iconNames.isEmpty {
+            for (index, url) in xcassets.enumerated() {
+                for name in iconNames {
+                    let setURL = url.appendingPathComponent("\(name).appiconset")
+                    if fm.fileExists(atPath: setURL.path) {
+                        return index
+                    }
                 }
+            }
+        }
+        // Fall back to whichever catalog has the primary AppIcon
+        for (index, url) in xcassets.enumerated() {
+            let primaryURL = url.appendingPathComponent("AppIcon.appiconset")
+            if fm.fileExists(atPath: primaryURL.path) {
+                return index
             }
         }
         return nil

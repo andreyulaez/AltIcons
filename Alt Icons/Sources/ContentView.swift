@@ -10,6 +10,12 @@ enum UpdateMode: String, CaseIterable, Identifiable, Equatable {
     var id: String { rawValue }
 }
 
+enum PrimarySwapAction: Hashable {
+    case swap
+    case removeOldPrimary
+    case demoteToAlternate
+}
+
 // MARK: - Content View
 
 struct ContentView: View {
@@ -68,6 +74,7 @@ struct WelcomeView: View {
             Spacer()
         }
         .frame(minWidth: 480, minHeight: 360)
+        .frame(maxWidth: .infinity)
         .background(Color(nsColor: .windowBackgroundColor))
     }
 }
@@ -78,6 +85,7 @@ struct ProjectView: View {
     @ObservedObject var viewModel: ViewModel
     @State private var showEditSheet = false
     @State private var iconToDelete: AppIconEntry?
+    @State private var iconForMakePrimary: AppIconEntry?
     @State private var logPanelHeight: CGFloat = 160
     @State private var dragStartHeight: CGFloat?
 
@@ -93,6 +101,7 @@ struct ProjectView: View {
             }
         }
         .frame(minWidth: 560, minHeight: 460)
+        .frame(maxWidth: .infinity)
         .background(Color(nsColor: .windowBackgroundColor))
         .toolbar { toolbarContent }
         .sheet(isPresented: $showEditSheet, onDismiss: {
@@ -116,6 +125,17 @@ struct ProjectView: View {
                 Text("Remove \"\(icon.name)\" from the project? This will delete the icon set and update project files.")
             }
         }
+        .sheet(isPresented: Binding(
+            get: { iconForMakePrimary != nil },
+            set: { if !$0 { iconForMakePrimary = nil } }
+        )) {
+            if let icon = iconForMakePrimary {
+                MakePrimarySheet(alternateIcon: icon) { action, customName in
+                    viewModel.makePrimary(icon, action: action, customName: customName)
+                    iconForMakePrimary = nil
+                }
+            }
+        }
         .onChange(of: viewModel.selectedXcassetsIndex) {
             viewModel.loadIcons()
         }
@@ -127,9 +147,14 @@ struct ProjectView: View {
     private var toolbarContent: some ToolbarContent {
         ToolbarItem(placement: .navigation) {
             if let config = viewModel.projectConfig {
-                Text(config.rootURL.lastPathComponent)
-                    .font(.headline)
-                    .padding(.horizontal, 8)
+                Button {
+                    viewModel.openProject()
+                } label: {
+                    Text(config.rootURL.lastPathComponent)
+                        .font(.headline)
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 8)
             }
         }
 
@@ -164,7 +189,7 @@ struct ProjectView: View {
                 Button {
                     viewModel.openProject()
                 } label: {
-                    Label("Open Different Project\u{2026}", systemImage: "folder")
+                    Label("Open Project\u{2026}", systemImage: "folder")
                 }
 
                 Divider()
@@ -212,9 +237,11 @@ struct ProjectView: View {
                     spacing: 12
                 ) {
                     ForEach(viewModel.icons) { icon in
-                        IconCard(icon: icon) {
+                        IconCard(icon: icon, onDelete: {
                             iconToDelete = icon
-                        }
+                        }, onMakePrimary: {
+                            iconForMakePrimary = icon
+                        })
                     }
                 }
                 .padding(20)
@@ -314,42 +341,29 @@ struct ProjectView: View {
 struct IconCard: View {
     let icon: AppIconEntry
     let onDelete: () -> Void
+    let onMakePrimary: () -> Void
     @State private var isHovering = false
 
     var body: some View {
         VStack(spacing: 8) {
-            ZStack(alignment: .topTrailing) {
-                Group {
-                    if let image = icon.previewImage {
-                        Image(nsImage: image)
-                            .resizable()
-                            .aspectRatio(1, contentMode: .fit)
-                            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                    } else {
-                        RoundedRectangle(cornerRadius: 18, style: .continuous)
-                            .fill(Color(nsColor: .controlBackgroundColor))
-                            .aspectRatio(1, contentMode: .fit)
-                            .overlay(
-                                Image(systemName: "app.fill")
-                                    .font(.largeTitle)
-                                    .foregroundStyle(.quaternary)
-                            )
-                    }
-                }
-                .shadow(color: .black.opacity(0.08), radius: 3, y: 2)
-
-                if isHovering && !icon.isPrimary {
-                    Button(action: onDelete) {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.title3)
-                            .symbolRenderingMode(.palette)
-                            .foregroundStyle(.white, Color.red)
-                    }
-                    .buttonStyle(.plain)
-                    .offset(x: 6, y: -6)
-                    .transition(.scale.combined(with: .opacity))
+            Group {
+                if let image = icon.previewImage {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(1, contentMode: .fit)
+                        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                } else {
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(Color(nsColor: .controlBackgroundColor))
+                        .aspectRatio(1, contentMode: .fit)
+                        .overlay(
+                            Image(systemName: "app.fill")
+                                .font(.largeTitle)
+                                .foregroundStyle(.quaternary)
+                        )
                 }
             }
+            .shadow(color: .black.opacity(0.08), radius: 3, y: 2)
 
             VStack(spacing: 2) {
                 Text(icon.name)
@@ -372,6 +386,13 @@ struct IconCard: View {
         .onHover { hovering in
             withAnimation(.easeInOut(duration: 0.15)) {
                 isHovering = hovering
+            }
+        }
+        .contextMenu {
+            if !icon.isPrimary {
+                Button("Make Primary\u{2026}") { onMakePrimary() }
+                Divider()
+                Button("Delete", role: .destructive) { onDelete() }
             }
         }
     }
@@ -464,6 +485,59 @@ struct EditSheet: View {
                 .font(.caption)
                 .foregroundStyle(.red)
         }
+    }
+}
+
+// MARK: - Make Primary Sheet
+
+struct MakePrimarySheet: View {
+    let alternateIcon: AppIconEntry
+    let onApply: (PrimarySwapAction, String) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectedAction: PrimarySwapAction = .swap
+    @State private var customAlternateName: String = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Make \"\(alternateIcon.name)\" Primary")
+                .font(.headline)
+
+            Text("What should happen to the current primary icon?")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            Picker("Action", selection: $selectedAction) {
+                Text("Swap (current primary becomes \"\(alternateIcon.name)\")")
+                    .tag(PrimarySwapAction.swap)
+                Text("Remove (delete current primary from project)")
+                    .tag(PrimarySwapAction.removeOldPrimary)
+                Text("Keep as alternate icon")
+                    .tag(PrimarySwapAction.demoteToAlternate)
+            }
+            .pickerStyle(.radioGroup)
+
+            if selectedAction == .demoteToAlternate {
+                TextField("Name for current primary icon", text: $customAlternateName)
+                    .textFieldStyle(.roundedBorder)
+                    .padding(.leading, 20)
+            }
+
+            Spacer()
+
+            HStack {
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Apply") {
+                    onApply(selectedAction, customAlternateName)
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(selectedAction == .demoteToAlternate && customAlternateName.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 420, height: selectedAction == .demoteToAlternate ? 300 : 260)
+        .animation(.easeInOut(duration: 0.15), value: selectedAction)
     }
 }
 
@@ -687,6 +761,71 @@ final class ViewModel: ObservableObject {
                 pbxprojPath: pbxprojPath,
                 logger: logger
             )
+
+            isLogPanelVisible = true
+            loadIcons()
+        } catch {
+            appendLog("Error: \(error.localizedDescription)")
+            isLogPanelVisible = true
+        }
+    }
+
+    // MARK: - Make Primary
+
+    func makePrimary(_ icon: AppIconEntry, action: PrimarySwapAction, customName: String) {
+        guard !icon.isPrimary, let config = projectConfig else { return }
+        guard let primaryIcon = icons.first(where: { $0.isPrimary }) else {
+            appendLog("No primary icon found in the project")
+            isLogPanelVisible = true
+            return
+        }
+
+        let fm = FileManager.default
+        let logger: @Sendable (String) -> Void = { [weak self] msg in
+            Task { @MainActor in self?.appendLog(msg) }
+        }
+
+        do {
+            let primaryParent = primaryIcon.setURL.deletingLastPathComponent()
+            let altParent = icon.setURL.deletingLastPathComponent()
+
+            switch action {
+            case .swap:
+                let tempURL = primaryParent.appendingPathComponent("_swap_temp_.appiconset")
+                try fm.moveItem(at: primaryIcon.setURL, to: tempURL)
+                try fm.moveItem(at: icon.setURL, to: primaryParent.appendingPathComponent("AppIcon.appiconset"))
+                try fm.moveItem(at: tempURL, to: altParent.appendingPathComponent("\(icon.name).appiconset"))
+                appendLog("Swapped \"\(icon.name)\" with primary icon")
+
+            case .removeOldPrimary:
+                try fm.removeItem(at: primaryIcon.setURL)
+                try fm.moveItem(at: icon.setURL, to: primaryParent.appendingPathComponent("AppIcon.appiconset"))
+                appendLog("Removed old primary, promoted \"\(icon.name)\"")
+
+                let remaining = icons.filter { !$0.isPrimary && $0.name != icon.name }.map(\.name)
+                _ = try Tool.updateInfoPlist(
+                    withNewAltIcons: remaining, mode: .replace,
+                    infoPlistPath: config.infoPlistPath, logger: logger
+                )
+                let pbxprojPath = try Tool.locatePBXProj(xcodeprojPath: config.xcodeprojPath)
+                try Tool.updatePBXProj(withAltIcons: remaining, pbxprojPath: pbxprojPath, logger: logger)
+
+            case .demoteToAlternate:
+                let name = customName.trimmingCharacters(in: .whitespaces)
+                let newAltURL = altParent.appendingPathComponent("\(name).appiconset")
+                try fm.moveItem(at: primaryIcon.setURL, to: newAltURL)
+                try fm.moveItem(at: icon.setURL, to: primaryParent.appendingPathComponent("AppIcon.appiconset"))
+                appendLog("Demoted primary to \"\(name)\", promoted \"\(icon.name)\"")
+
+                var remaining = icons.filter { !$0.isPrimary && $0.name != icon.name }.map(\.name)
+                remaining.append(name)
+                _ = try Tool.updateInfoPlist(
+                    withNewAltIcons: remaining, mode: .replace,
+                    infoPlistPath: config.infoPlistPath, logger: logger
+                )
+                let pbxprojPath = try Tool.locatePBXProj(xcodeprojPath: config.xcodeprojPath)
+                try Tool.updatePBXProj(withAltIcons: remaining, pbxprojPath: pbxprojPath, logger: logger)
+            }
 
             isLogPanelVisible = true
             loadIcons()
