@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 struct ImageSpec {
     let idiom: String
@@ -13,7 +14,7 @@ struct ResizedImage {
     let platform: String?
     let size: String
     let scale: String?
-    
+
     var jsonEntry: [String: String] {
         var result: [String: String] = [
             "idiom": idiom,
@@ -24,4 +25,20 @@ struct ResizedImage {
         if let scale = scale { result["scale"] = scale }
         return result
     }
+}
+
+struct ProjectConfig {
+    let rootURL: URL
+    let xcodeprojPath: String
+    let infoPlistPath: String
+    let xcassetsPaths: [String]
+    let defaultXcassetsIndex: Int
+}
+
+struct AppIconEntry: Identifiable {
+    var id: String { name }
+    let name: String
+    let setURL: URL
+    let previewImage: NSImage?
+    let isPrimary: Bool
 }

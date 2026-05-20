@@ -6,5 +6,6 @@ struct AltIconsApp: App {
         WindowGroup {
             ContentView()
         }
+        .windowToolbarStyle(.unified)
     }
 }

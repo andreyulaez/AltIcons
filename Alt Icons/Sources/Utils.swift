@@ -4,6 +4,180 @@ import CoreGraphics
 import AppKit
 import ImageIO
 
+// MARK: - Project Discovery
+
+struct DiscoveryError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+}
+
+enum ProjectDiscovery {
+    private static let fm = FileManager.default
+    private static let skipDirNames: Set<String> = [
+        "Pods", ".build", "DerivedData", "node_modules",
+        "Carthage", ".git", "build", "Build", ".swiftpm"
+    ]
+
+    static func discover(at rootURL: URL) -> Result<ProjectConfig, DiscoveryError> {
+        let xcodeprojs = findItems(in: rootURL, extension: "xcodeproj")
+        guard let xcodeproj = xcodeprojs.first else {
+            return .failure(DiscoveryError(message: "No .xcodeproj found in the selected directory."))
+        }
+
+        let plists = findInfoPlists(in: rootURL)
+        guard let plist = plists.first else {
+            return .failure(DiscoveryError(message: "No Info.plist found in the selected directory."))
+        }
+
+        let xcassets = findItems(in: rootURL, extension: "xcassets")
+        guard !xcassets.isEmpty else {
+            return .failure(DiscoveryError(message: "No .xcassets catalog found in the selected directory."))
+        }
+
+        let altNames = readAlternateIconNames(infoPlistPath: plist.path)
+        let defaultIndex = bestXcassetsIndex(xcassets: xcassets, iconNames: altNames) ?? 0
+
+        return .success(ProjectConfig(
+            rootURL: rootURL,
+            xcodeprojPath: xcodeproj.path,
+            infoPlistPath: plist.path,
+            xcassetsPaths: xcassets.map(\.path),
+            defaultXcassetsIndex: defaultIndex
+        ))
+    }
+
+    // MARK: Finders
+
+    static func findItems(in directory: URL, extension ext: String) -> [URL] {
+        var results: [URL] = []
+        guard let enumerator = fm.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return results }
+
+        while let url = enumerator.nextObject() as? URL {
+            if skipDirNames.contains(url.lastPathComponent) {
+                enumerator.skipDescendants()
+                continue
+            }
+            if url.pathExtension == ext {
+                results.append(url)
+                enumerator.skipDescendants()
+            }
+        }
+        return results
+    }
+
+    static func findInfoPlists(in directory: URL) -> [URL] {
+        var results: [URL] = []
+        guard let enumerator = fm.enumerator(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return results }
+
+        while let url = enumerator.nextObject() as? URL {
+            let name = url.lastPathComponent
+            if skipDirNames.contains(name)
+                || name.hasSuffix(".xcodeproj")
+                || name.hasSuffix(".xcassets")
+                || name.hasSuffix(".framework")
+                || name.hasSuffix(".xcframework") {
+                enumerator.skipDescendants()
+                continue
+            }
+            if name == "Info.plist" || name.hasSuffix("-Info.plist") {
+                results.append(url)
+            }
+        }
+
+        results.sort { $0.pathComponents.count < $1.pathComponents.count }
+        return results
+    }
+
+    // MARK: Cross-reference
+
+    static func readAlternateIconNames(infoPlistPath: String) -> [String] {
+        guard let data = fm.contents(atPath: infoPlistPath),
+              let plist = try? PropertyListSerialization.propertyList(
+                  from: data, options: [], format: nil
+              ) as? [String: Any],
+              let icons = plist["CFBundleIcons"] as? [String: Any],
+              let alt = icons["CFBundleAlternateIcons"] as? [String: Any]
+        else { return [] }
+        return Array(alt.keys).sorted()
+    }
+
+    static func bestXcassetsIndex(xcassets: [URL], iconNames: [String]) -> Int? {
+        guard !iconNames.isEmpty else { return nil }
+        for (index, url) in xcassets.enumerated() {
+            for name in iconNames {
+                let setURL = url.appendingPathComponent("\(name).appiconset")
+                if fm.fileExists(atPath: setURL.path) {
+                    return index
+                }
+            }
+        }
+        return nil
+    }
+
+    // MARK: Icon loading
+
+    static func loadIconEntries(xcassetsPath: String) -> [AppIconEntry] {
+        let xcassetsURL = URL(fileURLWithPath: xcassetsPath)
+        guard let sets = try? Tool.findAllAppIconSets(in: xcassetsURL) else {
+            return []
+        }
+
+        var entries: [AppIconEntry] = []
+        for setURL in sets {
+            let name = setURL.deletingPathExtension().lastPathComponent
+            let isPrimary = (name == "AppIcon")
+            let image = loadPreviewImage(from: setURL)
+            entries.append(AppIconEntry(
+                name: name,
+                setURL: setURL,
+                previewImage: image,
+                isPrimary: isPrimary
+            ))
+        }
+
+        entries.sort { a, b in
+            if a.isPrimary != b.isPrimary { return a.isPrimary }
+            return a.name.localizedStandardCompare(b.name) == .orderedAscending
+        }
+        return entries
+    }
+
+    static func loadPreviewImage(from setURL: URL) -> NSImage? {
+        let contentsURL = setURL.appendingPathComponent("Contents.json")
+        guard let data = try? Data(contentsOf: contentsURL),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let images = json["images"] as? [[String: Any]]
+        else { return nil }
+
+        let sorted = images.sorted { a, b in
+            let sA = (a["size"] as? String) ?? ""
+            let sB = (b["size"] as? String) ?? ""
+            if sA == "1024x1024" { return true }
+            if sB == "1024x1024" { return false }
+            return sA > sB
+        }
+
+        for entry in sorted {
+            guard let filename = entry["filename"] as? String, !filename.isEmpty else { continue }
+            let fileURL = setURL.appendingPathComponent(filename)
+            if let image = NSImage(contentsOf: fileURL) {
+                return image
+            }
+        }
+        return nil
+    }
+}
+
+// MARK: - Tool
+
 enum Tool {
     static let fm = FileManager.default
     
@@ -25,7 +199,7 @@ enum Tool {
     static func collectIconNames(iconsFolderPath: String) throws -> [String] {
         let files = try fm.contentsOfDirectory(atPath: iconsFolderPath).filter {
             let ext = URL(fileURLWithPath: $0).pathExtension.lowercased()
-            return ext == "png" || ext == "jpg"
+            return ext == "png" || ext == "jpg" || ext == "jpeg"
         }
         let names = files.map {
             URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent
@@ -59,7 +233,7 @@ enum Tool {
     ) throws {
         let files = try fm.contentsOfDirectory(atPath: iconsFolderPath).filter {
             let ext = URL(fileURLWithPath: $0).pathExtension.lowercased()
-            return ext == "png" || ext == "jpg"
+            return ext == "png" || ext == "jpg" || ext == "jpeg"
         }
         
         guard !files.isEmpty else {
@@ -205,30 +379,20 @@ enum Tool {
     
     static func generateAllSizes(from originalFile: URL, specs: [ImageSpec]) async throws -> [ResizedImage] {
         var result = [ResizedImage]()
+
         for spec in specs {
-            if spec.size == "1024x1024", spec.scale == nil {
-                result.append(
-                    ResizedImage(
-                        fileName: originalFile.lastPathComponent,
-                        idiom: spec.idiom,
-                        platform: spec.platform,
-                        size: spec.size,
-                        scale: spec.scale
-                    )
+            let newURL = try await resizeImage(originalFile, spec: spec)
+            result.append(
+                ResizedImage(
+                    fileName: newURL.lastPathComponent,
+                    idiom: spec.idiom,
+                    platform: spec.platform,
+                    size: spec.size,
+                    scale: spec.scale
                 )
-            } else {
-                let newURL = try await resizeImage(originalFile, spec: spec)
-                result.append(
-                    ResizedImage(
-                        fileName: newURL.lastPathComponent,
-                        idiom: spec.idiom,
-                        platform: spec.platform,
-                        size: spec.size,
-                        scale: spec.scale
-                    )
-                )
-            }
+            )
         }
+
         return result
     }
     
@@ -236,31 +400,33 @@ enum Tool {
         let sizeToken = spec.size.replacingOccurrences(of: ".", with: "_")
         let scaleToken = spec.scale.map { "@\($0)" } ?? ""
         let imageName = "icon-\(sizeToken)\(scaleToken).png"
-        
+
         let targetURL = file.deletingLastPathComponent().appendingPathComponent(imageName)
-        
+
         let sizeVals = spec.size.split(separator: "x").compactMap { Double($0) }
         guard sizeVals.count == 2 else { throw NSError(domain: "SizeError", code: 0) }
-        
+
         let scaleVal = spec.scale?.replacingOccurrences(of: "x", with: "") ?? "1"
         guard let scaleNumber = Double(scaleVal) else { throw NSError(domain: "ScaleError", code: 0) }
-        
+
         let width = Int(sizeVals[0] * scaleNumber)
         let height = Int(sizeVals[1] * scaleNumber)
-        
+
         guard let cgImage = loadCGImage(file) else {
             throw NSError(domain: "CGImageLoadError", code: 0)
         }
-        guard let resizedCG = resizeCGImage(cgImage, width: width, height: height) else {
+
+        guard let resizedCG = resizeCGImageWithoutAlpha(cgImage, width: width, height: height) else {
             throw NSError(domain: "CGImageResizeError", code: 0)
         }
-        
+
         let bitmapRep = NSBitmapImageRep(cgImage: resizedCG)
         bitmapRep.size = NSSize(width: width, height: height)
+
         guard let pngData = bitmapRep.representation(using: .png, properties: [:]) else {
             throw NSError(domain: "PNGWriteError", code: 0)
         }
-        
+
         try pngData.write(to: targetURL)
         return targetURL
     }
@@ -274,11 +440,10 @@ enum Tool {
         return image
     }
     
-    static func resizeCGImage(_ image: CGImage, width: Int, height: Int) -> CGImage? {
+    static func resizeCGImageWithoutAlpha(_ image: CGImage, width: Int, height: Int) -> CGImage? {
         let colorSpace = CGColorSpaceCreateDeviceRGB()
-        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
-            | CGBitmapInfo.byteOrder32Big.rawValue
-        
+        let bitmapInfo = CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+
         guard let context = CGContext(
             data: nil,
             width: width,
@@ -290,9 +455,12 @@ enum Tool {
         ) else {
             return nil
         }
-        
+
         context.interpolationQuality = .high
+        context.setFillColor(NSColor.white.cgColor)
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
         context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+
         return context.makeImage()
     }
     
