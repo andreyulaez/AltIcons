@@ -608,3 +608,248 @@ enum Tool {
         logger("Updated .pbxproj for ALL configurations (ASSETCATALOG_COMPILER_* settings)")
     }
 }
+
+// MARK: - Icon Validator
+
+enum IconValidator {
+    private static let fm = FileManager.default
+
+    static func validateAllIconSets(xcassetsPath: String) -> FullValidationReport {
+        let root = URL(fileURLWithPath: xcassetsPath)
+        guard let sets = try? Tool.findAllAppIconSets(in: root) else {
+            return FullValidationReport(iconSetReports: [])
+        }
+        let reports = sets.map { validateSingleIconSet(setURL: $0) }
+        return FullValidationReport(iconSetReports: reports)
+    }
+
+    static func validateSingleIconSet(setURL: URL) -> IconSetValidationReport {
+        let setName = setURL.deletingPathExtension().lastPathComponent
+        var issues: [ValidationIssue] = []
+
+        let contentsURL = setURL.appendingPathComponent("Contents.json")
+        guard let data = try? Data(contentsOf: contentsURL) else {
+            issues.append(ValidationIssue(
+                severity: .error, kind: .invalidJSON,
+                file: "Contents.json",
+                message: "Contents.json is missing or unreadable"
+            ))
+            return IconSetValidationReport(setName: setName, setURL: setURL, issues: issues)
+        }
+
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let images = json["images"] as? [[String: Any]] else {
+            issues.append(ValidationIssue(
+                severity: .error, kind: .invalidJSON,
+                file: "Contents.json",
+                message: "Contents.json is not valid JSON or missing \"images\" array"
+            ))
+            return IconSetValidationReport(setName: setName, setURL: setURL, issues: issues)
+        }
+
+        for (index, entry) in images.enumerated() {
+            guard let _ = entry["idiom"] as? String else {
+                issues.append(ValidationIssue(
+                    severity: .error, kind: .missingRequiredField,
+                    file: "Contents.json",
+                    message: "Image entry \(index) missing required field \"idiom\""
+                ))
+                continue
+            }
+            guard let _ = entry["size"] as? String else {
+                issues.append(ValidationIssue(
+                    severity: .error, kind: .missingRequiredField,
+                    file: "Contents.json",
+                    message: "Image entry \(index) missing required field \"size\""
+                ))
+                continue
+            }
+
+            guard let filename = entry["filename"] as? String, !filename.isEmpty else {
+                continue
+            }
+
+            let ext = URL(fileURLWithPath: filename).pathExtension.lowercased()
+            if ext == "jpg" || ext == "jpeg" {
+                issues.append(ValidationIssue(
+                    severity: .error, kind: .jpegReference,
+                    file: filename,
+                    message: "JPEG file referenced — app icons must be PNG"
+                ))
+            } else if ext != "png" {
+                issues.append(ValidationIssue(
+                    severity: .error, kind: .notPNG,
+                    file: filename,
+                    message: "File extension \".\(ext)\" is not .png"
+                ))
+            }
+
+            let fileURL = setURL.appendingPathComponent(filename)
+            guard fm.fileExists(atPath: fileURL.path) else {
+                issues.append(ValidationIssue(
+                    severity: .error, kind: .missingFile,
+                    file: filename,
+                    message: "File referenced in Contents.json does not exist on disk"
+                ))
+                continue
+            }
+
+            guard let imageSource = CGImageSourceCreateWithURL(fileURL as CFURL, nil),
+                  CGImageSourceGetCount(imageSource) > 0 else {
+                issues.append(ValidationIssue(
+                    severity: .error, kind: .corruptedImage,
+                    file: filename,
+                    message: "File is not a valid image or is corrupted"
+                ))
+                continue
+            }
+
+            let uti = CGImageSourceGetType(imageSource) as? String ?? ""
+            if !uti.contains("png") {
+                issues.append(ValidationIssue(
+                    severity: .error, kind: .notPNG,
+                    file: filename,
+                    message: "File content is not PNG (detected: \(uti))"
+                ))
+                continue
+            }
+
+            if let cgImage = CGImageSourceCreateImageAtIndex(imageSource, 0, nil) {
+                if imageHasAlpha(cgImage) {
+                    issues.append(ValidationIssue(
+                        severity: .error, kind: .hasAlpha,
+                        file: filename,
+                        message: "PNG contains alpha channel / transparency"
+                    ))
+                }
+            } else {
+                issues.append(ValidationIssue(
+                    severity: .error, kind: .corruptedImage,
+                    file: filename,
+                    message: "Could not decode image data"
+                ))
+            }
+        }
+
+        return IconSetValidationReport(setName: setName, setURL: setURL, issues: issues)
+    }
+
+    static func imageHasAlpha(_ image: CGImage) -> Bool {
+        switch image.alphaInfo {
+        case .none, .noneSkipLast, .noneSkipFirst:
+            return false
+        case .premultipliedLast, .premultipliedFirst, .last, .first, .alphaOnly:
+            return true
+        @unknown default:
+            return true
+        }
+    }
+
+    // MARK: - Fix
+
+    static func fixAllIcons(
+        xcassetsPath: String,
+        logger: @Sendable (String) -> Void
+    ) -> FullValidationReport {
+        let root = URL(fileURLWithPath: xcassetsPath)
+        guard let sets = try? Tool.findAllAppIconSets(in: root) else {
+            return FullValidationReport(iconSetReports: [])
+        }
+
+        for setURL in sets {
+            fixIconSet(setURL: setURL, logger: logger)
+        }
+
+        let report = validateAllIconSets(xcassetsPath: xcassetsPath)
+        return report
+    }
+
+    static func fixIconSet(
+        setURL: URL,
+        logger: @Sendable (String) -> Void
+    ) {
+        let contentsURL = setURL.appendingPathComponent("Contents.json")
+        guard let data = try? Data(contentsOf: contentsURL),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var images = json["images"] as? [[String: Any]] else {
+            logger("Skip \(setURL.lastPathComponent): invalid Contents.json")
+            return
+        }
+
+        var contentsChanged = false
+
+        for i in 0..<images.count {
+            guard let filename = images[i]["filename"] as? String, !filename.isEmpty else { continue }
+
+            let fileURL = setURL.appendingPathComponent(filename)
+            guard fm.fileExists(atPath: fileURL.path) else { continue }
+
+            let ext = URL(fileURLWithPath: filename).pathExtension.lowercased()
+            let baseName = URL(fileURLWithPath: filename).deletingPathExtension().lastPathComponent
+            let isJPEG = (ext == "jpg" || ext == "jpeg")
+            let needsExtensionFix = (ext != "png")
+
+            guard let imageSource = CGImageSourceCreateWithURL(fileURL as CFURL, nil),
+                  CGImageSourceGetCount(imageSource) > 0,
+                  let cgImage = CGImageSourceCreateImageAtIndex(imageSource, 0, nil) else {
+                logger("Skip \(filename): could not load image")
+                continue
+            }
+
+            let hasAlpha = imageHasAlpha(cgImage)
+            let uti = CGImageSourceGetType(imageSource) as? String ?? ""
+            let isActualPNG = uti.contains("png")
+
+            let needsFix = hasAlpha || !isActualPNG || needsExtensionFix || isJPEG
+
+            guard needsFix else { continue }
+
+            let width = cgImage.width
+            let height = cgImage.height
+
+            guard let flattened = Tool.resizeCGImageWithoutAlpha(cgImage, width: width, height: height) else {
+                logger("Skip \(filename): could not flatten image")
+                continue
+            }
+
+            let bitmapRep = NSBitmapImageRep(cgImage: flattened)
+            bitmapRep.size = NSSize(width: width, height: height)
+
+            guard let pngData = bitmapRep.representation(using: .png, properties: [:]) else {
+                logger("Skip \(filename): could not encode as PNG")
+                continue
+            }
+
+            let newFilename = baseName + ".png"
+            let newFileURL = setURL.appendingPathComponent(newFilename)
+
+            if newFilename != filename {
+                try? fm.removeItem(at: fileURL)
+            }
+
+            do {
+                try pngData.write(to: newFileURL)
+            } catch {
+                logger("Error writing \(newFilename): \(error.localizedDescription)")
+                continue
+            }
+
+            if newFilename != filename {
+                images[i]["filename"] = newFilename
+                contentsChanged = true
+                logger("Fixed \(filename) → \(newFilename) (re-encoded as opaque PNG)")
+            } else {
+                logger("Fixed \(filename) (re-encoded as opaque PNG)")
+            }
+        }
+
+        if contentsChanged {
+            var updatedJSON = json
+            updatedJSON["images"] = images
+            if let updatedData = try? JSONSerialization.data(withJSONObject: updatedJSON, options: .prettyPrinted) {
+                try? updatedData.write(to: contentsURL)
+                logger("Updated Contents.json for \(setURL.lastPathComponent)")
+            }
+        }
+    }
+}

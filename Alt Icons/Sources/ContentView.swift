@@ -139,6 +139,9 @@ struct ProjectView: View {
         .onChange(of: viewModel.selectedXcassetsIndex) {
             viewModel.loadIcons()
         }
+        .sheet(isPresented: $viewModel.showValidationReport) {
+            ValidationReportSheet(viewModel: viewModel)
+        }
     }
 
     // MARK: - Toolbar
@@ -171,6 +174,16 @@ struct ProjectView: View {
         }
 
         ToolbarItemGroup(placement: .primaryAction) {
+            if let report = viewModel.validationReport, !report.isValid {
+                Button {
+                    viewModel.showValidationReport = true
+                } label: {
+                    Label("\(report.totalErrors)", systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.red)
+                }
+                .help("\(report.totalErrors) icon validation error(s)")
+            }
+
             Button {
                 showEditSheet = true
             } label: {
@@ -541,6 +554,148 @@ struct MakePrimarySheet: View {
     }
 }
 
+// MARK: - Validation Report Sheet
+
+struct ValidationReportSheet: View {
+    @ObservedObject var viewModel: ViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+            Divider()
+            issueList
+            Divider()
+            footer
+        }
+        .frame(width: 520, height: 420)
+    }
+
+    private var header: some View {
+        HStack {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.red)
+                .font(.title3)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Icon Validation Report")
+                    .font(.headline)
+                if let report = viewModel.validationReport {
+                    Text("\(report.totalErrors) error(s), \(report.totalWarnings) warning(s)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Spacer()
+
+            if let report = viewModel.validationReport, report.isValid {
+                Label("App Store Safe", systemImage: "checkmark.seal.fill")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.green)
+            }
+        }
+        .padding(16)
+    }
+
+    private var issueList: some View {
+        ScrollView {
+            if let report = viewModel.validationReport {
+                if report.isValid {
+                    VStack(spacing: 12) {
+                        Spacer()
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 36))
+                            .foregroundStyle(.green)
+                        Text("All icons passed validation")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(report.iconSetReports.filter { !$0.isValid }) { setReport in
+                            Section {
+                                ForEach(setReport.issues) { issue in
+                                    issueRow(issue, setName: setReport.setName)
+                                }
+                            } header: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "app.fill")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Text(setReport.setName)
+                                        .font(.subheadline.weight(.medium))
+                                    Text("\(setReport.errorCount) error(s)")
+                                        .font(.caption)
+                                        .foregroundStyle(.red)
+                                }
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 8)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func issueRow(_ issue: ValidationIssue, setName: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: issue.severity == .error ? "xmark.circle.fill" : "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(issue.severity == .error ? .red : .orange)
+                .padding(.top, 2)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(issue.file)
+                    .font(.caption.monospaced().weight(.medium))
+                Text(issue.message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
+    }
+
+    private var footer: some View {
+        HStack {
+            Button("Close") { dismiss() }
+                .keyboardShortcut(.cancelAction)
+
+            Spacer()
+
+            if let report = viewModel.validationReport, !report.isValid {
+                Button {
+                    Task {
+                        await viewModel.fixIcons()
+                    }
+                } label: {
+                    if viewModel.isFixing {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Fixing\u{2026}")
+                        }
+                    } else {
+                        Label("Fix Icons", systemImage: "wrench.and.screwdriver")
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(viewModel.isFixing)
+            }
+        }
+        .padding(16)
+    }
+}
+
 // MARK: - ViewModel
 
 @MainActor
@@ -559,6 +714,12 @@ final class ViewModel: ObservableObject {
     @Published var logs: String = ""
     @Published var isLogPanelVisible: Bool = false
     @Published var isRunning: Bool = false
+
+    // Validation
+    @Published var validationReport: FullValidationReport?
+    @Published var isValidating: Bool = false
+    @Published var isFixing: Bool = false
+    @Published var showValidationReport: Bool = false
 
     private let specs: [ImageSpec] = [
         .init(idiom: "universal", platform: "ios", size: "20x20", scale: "2x"),
@@ -606,10 +767,12 @@ final class ViewModel: ObservableObject {
               selectedXcassetsIndex < config.xcassetsPaths.count
         else {
             icons = []
+            validationReport = nil
             return
         }
         let path = config.xcassetsPaths[selectedXcassetsIndex]
         icons = ProjectDiscovery.loadIconEntries(xcassetsPath: path)
+        validateIcons()
     }
 
     // MARK: - Edit helpers
@@ -832,6 +995,51 @@ final class ViewModel: ObservableObject {
         } catch {
             appendLog("Error: \(error.localizedDescription)")
             isLogPanelVisible = true
+        }
+    }
+
+    // MARK: - Validation
+
+    func validateIcons() {
+        guard let config = projectConfig,
+              selectedXcassetsIndex < config.xcassetsPaths.count else {
+            validationReport = nil
+            return
+        }
+        isValidating = true
+        let path = config.xcassetsPaths[selectedXcassetsIndex]
+        validationReport = IconValidator.validateAllIconSets(xcassetsPath: path)
+        isValidating = false
+    }
+
+    func fixIcons() async {
+        guard let config = projectConfig,
+              selectedXcassetsIndex < config.xcassetsPaths.count else { return }
+
+        isFixing = true
+        isLogPanelVisible = true
+        let path = config.xcassetsPaths[selectedXcassetsIndex]
+
+        let logger: @Sendable (String) -> Void = { [weak self] msg in
+            Task { @MainActor in
+                self?.appendLog(msg)
+            }
+        }
+
+        appendLog("Fixing icon issues...")
+
+        let report = await Task.detached(priority: .userInitiated) {
+            IconValidator.fixAllIcons(xcassetsPath: path, logger: logger)
+        }.value
+
+        validationReport = report
+        loadIcons()
+        isFixing = false
+
+        if report.isValid {
+            appendLog("All icons are now App Store Connect safe")
+        } else {
+            appendLog("Some issues could not be auto-fixed (\(report.totalErrors) error(s) remaining)")
         }
     }
 
